@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-import re
 import asyncio
+from playwright.async_api import async_playwright
+import re
 
 st.set_page_config(
     page_title="Train Availability Checker",
@@ -23,35 +24,63 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-async def search_trains_async(from_station: str, to_station: str, date: str):
-    """Search trains using Playwright"""
-    from playwright.async_api import async_playwright
-    
-    url = f"https://www.confirmtkt.com/rbooking/trains/from/{from_station}/to/{to_station}/{date}"
-    
-    try:
+
+class TrainScraper:
+    async def search_trains_async(self, from_station: str, to_station: str, date: str):
+        url = f"https://www.confirmtkt.com/rbooking/trains/from/{from_station}/to/{to_station}/{date}"
+        
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled']
+            )
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            page = await context.new_page()
             
-            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(15000)
             
-            await page.wait_for_timeout(3000)
-            
-            html = await page.content()
+            text = await page.evaluate("document.body.innerText")
             await browser.close()
             
-            return {
-                "url": url,
-                "html_length": len(html),
-                "html": html[:5000]
-            }
-    except Exception as e:
-        return {"error": str(e), "url": url}
-
-def search_trains(from_station: str, to_station: str, date: str):
-    """Sync wrapper for async function"""
-    return asyncio.run(search_trains_async(from_station, to_station, date))
+            return self._parse_text(text, from_station, to_station, date)
+    
+    def _parse_text(self, text: str, source: str, destination: str, date: str):
+        lines = text.split('\n')
+        trains = []
+        
+        for line in lines:
+            line = line.strip()
+            train_match = re.match(r'(\d{5,6})\s*(.+?)(?:\s+(CNF|WL|Regret|N\/A))?\s*$', line)
+            
+            if train_match:
+                train_num = train_match.group(1)
+                train_name = train_match.group(2).strip()[:50]
+                status_raw = train_match.group(3) if train_match.group(3) else ""
+                
+                if 'WL' in status_raw:
+                    status = f"WL"
+                elif 'CNF' in status_raw:
+                    status = "Confirm"
+                elif 'Regret' in status_raw:
+                    status = "Regret"
+                else:
+                    status = "Check"
+                
+                trains.append({
+                    "Train No": train_num,
+                    "Train Name": train_name,
+                    "Status": status
+                })
+        
+        return {
+            "source": source,
+            "destination": destination,
+            "date": date,
+            "trains": trains[:15]
+        }
 
 
 POPULAR_STATIONS = {
@@ -68,6 +97,11 @@ POPULAR_STATIONS = {
     "ADI": "Ahmedabad",
     "LDH": "Ludhiana"
 }
+
+async def search_trains_async(from_station, to_station, date):
+    scraper = TrainScraper()
+    return await scraper.search_trains_async(from_station, to_station, date)
+
 
 st.title("🚂 Train Availability Checker")
 st.markdown("Check Indian Railway seat availability easily!")
@@ -87,7 +121,7 @@ with col2:
         "To Station", 
         options=list(POPULAR_STATIONS.keys()),
         format_func=lambda x: f"{x} - {POPULAR_STATIONS[x]}",
-        index=1
+        index=7
     )
 
 with col3:
@@ -102,20 +136,32 @@ with col3:
 date_str = travel_date.strftime("%d-%m-%Y")
 
 if st.button("🔍 Search Trains", use_container_width=True):
-    with st.spinner("Loading page with browser..."):
-        result = search_trains(from_station, to_station, date_str)
+    with st.spinner("Loading trains... (may take 15-20 seconds)"):
+        result = asyncio.run(search_trains_async(from_station, to_station, date_str))
         
-        st.write("### Debug Info")
-        st.write(f"**URL:** {result.get('url', 'N/A')}")
-        st.write(f"**HTML Length:** {result.get('html_length', 'N/A')}")
-        
-        if "error" in result:
-            st.error(f"Error: {result['error']}")
-        else:
-            with st.expander("View HTML Content"):
-                st.text(result.get('html', 'No HTML'))
+        if result.get("trains"):
+            st.success(f"Found {len(result['trains'])} trains!")
             
-            st.info("Scraper ready! Install playwright: pip install playwright && playwright install chromium")
+            df = pd.DataFrame(result["trains"])
+            
+            def color_status(val):
+                if 'Confirm' in str(val):
+                    return '✅ ' + str(val)
+                elif 'WL' in str(val):
+                    return '⏳ ' + str(val)
+                elif 'Regret' in str(val):
+                    return '❌ ' + str(val)
+                return str(val)
+            
+            df['Status'] = df['Status'].apply(color_status)
+            
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.warning("No trains found! Try different stations or date.")
 
 st.markdown("---")
 st.markdown("**Popular Routes:**")
